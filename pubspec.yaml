@@ -1,0 +1,23 @@
+name: network_suite_shared
+description: "Shared models and cross-process SQLite database for the Network Suite."
+version: 1.0.0
+publish_to: 'none'
+
+environment:
+  sdk: ^3.13.0
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  sqlite3: ^3.7.1
+  sqlite3_flutter_libs: ^0.6.0+eol
+  path_provider: ^2.1.6
+  path: ^1.9.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
