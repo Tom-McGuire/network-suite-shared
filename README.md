@@ -1,39 +1,345 @@
-<!--
-This README describes the package. If you publish this package to pub.dev,
-this README's contents appear on the landing page for your package.
+# network_suite_shared
 
-For information about how to write a good package README, see the guide for
-[writing package pages](https://dart.dev/tools/pub/writing-package-pages).
+Shared device models, IEEE OUI vendor resolution, and cross-process SQLite database engine for the Network Suite ecosystem (Syslog Server, ARP-Scout, Net-App-Launcher, etc.).
 
-For general information about developing packages, see the Dart guide for
-[creating packages](https://dart.dev/guides/libraries/create-packages)
-and the Flutter guide for
-[developing packages and plugins](https://flutter.dev/to/develop-packages).
--->
+---
 
-TODO: Put a short description of the package here that helps potential users
-know whether this package might be useful for them.
+## Overview
+
+In the Network Suite ecosystem, multiple standalone desktop applications run simultaneously and interact with the same local physical network devices. `network_suite_shared` provides a centralized, cross-process data store and shared utilities so all tools share a unified view of device identities.
+
+### Core Principles
+
+- **MAC Address as Primary Identity**: Network devices are identified permanently by their physical MAC address in canonical uppercase IEEE 802 format (`XX:XX:XX:XX:XX:XX`).
+- **Exclusion of Volatile Attributes**: Dynamic properties like IP addresses are deliberately **not** stored in this database. IP addresses change across DHCP leases, roaming, and subnet renumbering, whereas MAC addresses identify hardware interfaces uniquely and permanently. Each individual application tracks its own runtime IP-to-MAC associations.
+- **Cross-Process Concurrency**: Multiple standalone apps (e.g., Syslog Server listening in the background while ARP-Scout runs a sweep and Net-App-Launcher manages devices) read and write to the same SQLite database file without locking conflicts.
+- **Resilient Fallback**: Applications can gracefully degrade to offline vendor lookups if the shared database is temporarily unreachable or uninitialized.
+
+---
 
 ## Features
 
-TODO: List what your package can do. Maybe include images, gifs, or videos.
+- **Cross-Process SQLite Storage**: Configured with SQLite Write-Ahead Logging (WAL) and a 5-second busy timeout for concurrent multi-process access.
+- **Canonical Storage Locations**: Automatically resolves platform-standard directories on Linux, macOS, and Windows.
+- **MAC Normalization & Validation**: Robust parsing supporting colon (`00:1A:2B:3C:4D:5E`), hyphen (`00-1A-2B-3C-4D-5E`), Cisco dotted-quad (`001a.2b3c.4d5e`), and raw hex formats.
+- **Offline OUI Vendor Lookup**: Built-in IEEE OUI lookup database mapping MAC prefixes to manufacturers (Apple, Cisco, Raspberry Pi, Ubiquiti, etc.), virtual router addresses (VRRP, Cisco HSRP), multicast ranges, and randomized/private MAC detection.
+- **Device Categorization**: Predefined categories (`DeviceCategory`) with human-readable labels and Flutter Material icons.
+- **Reactivity**: Broadcast change notifications (`onDatabaseChanged`) to refresh application UIs when records are modified.
 
-## Getting started
+---
 
-TODO: List prerequisites and provide or point to information on how to
-start using the package.
+## Database Architecture
 
-## Usage
+### Default File Locations
 
-TODO: Include short and useful examples for package users. Add longer examples
-to `/example` folder.
+The database is stored under a common directory across the suite:
 
-```dart
-const like = 'sample';
+| Platform | Path |
+| :--- | :--- |
+| **Linux / POSIX** | `~/.local/share/NetworkSuite/shared_devices.db`<br>*(or `$XDG_DATA_HOME/NetworkSuite/shared_devices.db`)* |
+| **macOS** | `~/Library/Application Support/NetworkSuite/shared_devices.db` |
+| **Windows** | `%LOCALAPPDATA%\NetworkSuite\shared_devices.db`<br>*(e.g., `C:\Users\<user>\AppData\Local\NetworkSuite\shared_devices.db`)* |
+
+### Concurrency & WAL Mode
+
+When initialized, the database automatically applies:
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = NORMAL;
 ```
 
-## Additional information
+This guarantees readers do not block writers and writers do not block readers across separate OS processes.
 
-TODO: Tell users more about the package: where to find more information, how to
-contribute to the package, how to file issues, what response they can expect
-from the package authors, and more.
+### Database Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS shared_devices (
+  mac_address TEXT PRIMARY KEY NOT NULL,
+  name        TEXT NOT NULL,
+  vendor      TEXT,
+  device_type TEXT,
+  notes       TEXT,
+  source_app  TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_shared_name ON shared_devices(name);
+CREATE INDEX IF NOT EXISTS idx_shared_vendor ON shared_devices(vendor);
+CREATE INDEX IF NOT EXISTS idx_shared_type ON shared_devices(device_type);
+```
+
+---
+
+## Integration Guide
+
+### 1. Add Dependency
+
+Add `network_suite_shared` to your application's `pubspec.yaml`:
+
+#### Git Repository (Recommended for Suite Apps)
+```yaml
+dependencies:
+  network_suite_shared:
+    git:
+      url: https://github.com/Tom-McGuire/network-suite-shared.git
+      ref: main
+```
+
+#### Local Path (Mono-repo / Development)
+```yaml
+dependencies:
+  network_suite_shared:
+    path: ../network-suite-shared
+```
+
+Run `flutter pub get`.
+
+---
+
+### 2. Initialize in `main()`
+
+Initialize the singleton database during application startup before running the app. Wrap initialization in a `try/catch` block so your application can run standalone even if file permissions or platform sandbox issues occur:
+
+```dart
+// lib/main.dart
+import 'package:flutter/material.dart';
+import 'package:network_suite_shared/network_suite_shared.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Safely initialize shared device database
+  try {
+    await SharedDeviceDatabase.instance.init();
+  } catch (e) {
+    debugPrint('Shared device database fallback: $e');
+  }
+
+  runApp(const MyApp());
+}
+```
+
+---
+
+### 3. Resolving Device Names & MAC Addresses
+
+When your application detects a MAC address (e.g. parsed from incoming syslog packets, ARP tables, or packet capture payloads), resolve a friendly display name using this priority hierarchy:
+
+1. **User-assigned friendly name** in `SharedDeviceDatabase`
+2. **Hardware Vendor** from IEEE OUI lookup + last 3 bytes of MAC
+3. **Normalized MAC address**
+
+```dart
+import 'package:network_suite_shared/network_suite_shared.dart';
+
+String resolveDeviceDisplayName(String rawMac) {
+  final normalized = SharedDevice.normalizeMac(rawMac);
+
+  // 1. Check shared database if initialized
+  if (SharedDeviceDatabase.instance.isInitialized) {
+    final device = SharedDeviceDatabase.instance.getDeviceByMac(normalized);
+    if (device != null && device.name.trim().isNotEmpty) {
+      return device.name.trim();
+    }
+  }
+
+  // 2. Fall back to OUI vendor resolution
+  final vendor = OuiLookup.lookupVendor(normalized);
+  if (vendor != 'Unknown Vendor' && vendor != 'Unknown Hardware') {
+    final suffix = normalized.split(':').sublist(3).join(':');
+    return '$vendor ($suffix)';
+  }
+
+  // 3. Fall back to MAC
+  return normalized;
+}
+```
+
+---
+
+### 4. Registering or Upserting Devices
+
+When an application discovers a new hardware device, or when a user edits device details:
+
+```dart
+import 'package:network_suite_shared/network_suite_shared.dart';
+
+void registerDiscoveredDevice({
+  required String rawMac,
+  String? hostNameHint,
+  required String appName,
+}) {
+  if (!SharedDevice.isValidMac(rawMac)) return;
+
+  final mac = SharedDevice.normalizeMac(rawMac);
+  final db = SharedDeviceDatabase.instance;
+  if (!db.isInitialized) return;
+
+  final existing = db.getDeviceByMac(mac);
+
+  if (existing == null) {
+    // New device: infer vendor and category
+    final vendor = OuiLookup.lookupVendor(mac);
+    final category = OuiLookup.inferCategory(vendor, hostNameHint);
+    final now = DateTime.now();
+
+    final device = SharedDevice(
+      macAddress: mac,
+      name: hostNameHint?.isNotEmpty == true ? hostNameHint! : 'Device $mac',
+      vendor: vendor != 'Unknown Vendor' ? vendor : null,
+      deviceType: category.key,
+      sourceApp: appName,
+      createdAt: now,
+      updatedAt: now,
+    );
+
+    db.upsertDevice(device);
+  }
+}
+```
+
+#### Updating Only the Friendly Name
+
+To update a device's custom name without overwriting other metadata:
+
+```dart
+SharedDeviceDatabase.instance.updateDeviceName('00:1A:2B:3C:4D:5E', 'Office Core Switch');
+```
+
+---
+
+### 5. Listening to Cross-Process Updates
+
+To refresh your UI or view-models whenever devices are added, updated, or removed:
+
+```dart
+class DeviceAwareViewModel extends ChangeNotifier {
+  StreamSubscription? _dbSubscription;
+
+  DeviceAwareViewModel() {
+    if (SharedDeviceDatabase.instance.isInitialized) {
+      _dbSubscription = SharedDeviceDatabase.instance.onDatabaseChanged.listen((_) {
+        // Reload device mappings and trigger UI update
+        notifyListeners();
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _dbSubscription?.cancel();
+    super.dispose();
+  }
+}
+```
+
+---
+
+### 6. Querying & Filtering Devices
+
+Query devices with keyword search, category filters, and sorting:
+
+```dart
+final devices = SharedDeviceDatabase.instance.getAllDevices(
+  query: 'cisco',           // Matches name, MAC, vendor, or notes
+  deviceType: 'switch',     // Matches DeviceCategory key, or null for all
+  sortBy: 'updated_at',     // 'name', 'mac', 'vendor', 'type', 'created_at', 'updated_at'
+  ascending: false,
+);
+```
+
+---
+
+### 7. Unit & Integration Testing
+
+In tests, avoid reading/writing to the host filesystem by initializing `SharedDeviceDatabase` with an in-memory SQLite database (`:memory:`):
+
+```dart
+import 'package:flutter_test/flutter_test.dart';
+import 'package:network_suite_shared/network_suite_shared.dart';
+
+void main() {
+  late SharedDeviceDatabase db;
+
+  setUp(() async {
+    db = SharedDeviceDatabase();
+    await db.init(dbPath: ':memory:');
+  });
+
+  tearDown(() {
+    db.close();
+  });
+
+  test('registers and queries test device', () {
+    db.upsertDevice(SharedDevice(
+      macAddress: '00:11:22:33:44:55',
+      name: 'Test Router',
+      sourceApp: 'unit_test',
+      createdAt: DateTime.now(),
+      updatedAt: DateTime.now(),
+    ));
+
+    final device = db.getDeviceByMac('00-11-22-33-44-55');
+    expect(device, isNotNull);
+    expect(device!.name, 'Test Router');
+  });
+}
+```
+
+---
+
+## API Summary
+
+### `SharedDeviceDatabase`
+
+| Method / Property | Description |
+| :--- | :--- |
+| `instance` | Default singleton database instance. |
+| `init({String? dbPath})` | Opens SQLite connection, enables WAL mode, and initializes tables. |
+| `isInitialized` | Boolean indicating whether the database is active. |
+| `databasePath` | Filesystem path to the current database file. |
+| `onDatabaseChanged` | Broadcast `Stream<void>` fired on upsert, update, or deletion. |
+| `getDeviceByMac(String mac)` | Retrieves `SharedDevice?` for the normalized MAC. |
+| `getAllDevices(...)` | Lists registered devices with query, type, and sort options. |
+| `upsertDevice(SharedDevice device)` | Inserts or updates a device record. |
+| `updateDeviceName(String mac, String newName)` | Updates only the friendly name and timestamp. |
+| `deleteDevice(String mac)` | Deletes a device record by MAC address. |
+| `importBatch(List<SharedDevice> devices)` | Batch inserts devices inside an atomic transaction. |
+| `getDeviceCount()` | Total number of recorded devices. |
+| `close()` | Closes SQLite connection and stream controllers. |
+
+### `SharedDevice`
+
+| Member | Type | Description |
+| :--- | :--- | :--- |
+| `macAddress` | `String` | Canonical uppercase MAC address (`XX:XX:XX:XX:XX:XX`). |
+| `name` | `String` | User-assigned or inferred friendly name. |
+| `vendor` | `String?` | Hardware manufacturer (from OUI or manual). |
+| `deviceType` | `String?` | Category key (matches `DeviceCategory.key`). |
+| `notes` | `String?` | Optional inventory or location notes. |
+| `sourceApp` | `String` | Application identifier that created or updated the entry. |
+| `createdAt` | `DateTime` | Creation timestamp. |
+| `updatedAt` | `DateTime` | Last update timestamp. |
+| `normalizeMac(String)` | `static String` | Cleans any MAC representation into canonical format. |
+| `isValidMac(String)` | `static bool` | Validates 6-byte non-zero MAC address format. |
+
+### `OuiLookup`
+
+| Method | Description |
+| :--- | :--- |
+| `lookupVendor(String mac)` | Returns manufacturer name, multicast label, or virtual router type. |
+| `inferCategory(String? vendor, [String? nameHint])` | Suggests a probable `DeviceCategory` based on vendor and name keywords. |
+
+### `DeviceCategory`
+
+Predefined categories with Material icons:
+- `pc`, `laptop`, `server`, `router`, `switchDevice` (`'switch'`), `accessPoint` (`'ap'`), `mobile`, `printer`, `nas`, `iot`, `camera`, `other`.
+
+---
+
+## License
+
+This package is proprietary to the Network Suite project.
