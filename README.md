@@ -23,7 +23,9 @@ In the Network Suite ecosystem, multiple standalone desktop applications run sim
 - **Canonical Storage Locations**: Automatically resolves platform-standard directories on Linux, macOS, and Windows.
 - **MAC Normalization & Validation**: Robust parsing supporting colon (`00:1A:2B:3C:4D:5E`), hyphen (`00-1A-2B-3C-4D-5E`), Cisco dotted-quad (`001a.2b3c.4d5e`), and raw hex formats.
 - **Offline OUI Vendor Lookup**: Built-in IEEE OUI lookup database mapping MAC prefixes to manufacturers (Apple, Cisco, Raspberry Pi, Ubiquiti, etc.), virtual router addresses (VRRP, Cisco HSRP), multicast ranges, and randomized/private MAC detection.
-- **Device Categorization**: Predefined categories (`DeviceCategory`) with human-readable labels and Flutter Material icons.
+- **Device Categorization & Custom Categories**: 12 predefined built-in categories (`DeviceCategory`) plus user-created custom categories (`CustomDeviceCategory`) with custom Material icons and color accents.
+- **Unified Category Resolution**: Unified model (`UnifiedDeviceCategory`) merging built-in and user categories for UI dropdowns, filter chips, and selector dialogues.
+- **Full Metadata Editing**: Full device detail editing (`updateDeviceDetails`) allowing simultaneous updates to friendly name, device category, vendor override, and freeform notes.
 - **Reactivity**: Broadcast change notifications (`onDatabaseChanged`) to refresh application UIs when records are modified.
 
 ---
@@ -220,9 +222,75 @@ To update a device's custom name without overwriting other metadata:
 SharedDeviceDatabase.instance.updateDeviceName('00:1A:2B:3C:4D:5E', 'Office Core Switch');
 ```
 
+#### Full Device Metadata Editing
+
+To edit any combination of friendly name, category, vendor, and notes in a single operation:
+
+```dart
+SharedDeviceDatabase.instance.updateDeviceDetails(
+  '00:1A:2B:3C:4D:5E',
+  name: 'Core Distribution Switch',
+  deviceType: 'firewall',                 // Built-in key or custom category slug
+  vendor: 'Cisco Systems, Inc.',
+  notes: 'Rack 2, Top-of-Rack Switch connected to fiber trunk',
+);
+```
+
+Any parameter left `null` keeps its existing value unchanged.
+
 ---
 
-### 5. Listening to Cross-Process Updates
+### 5. Managing Custom Device Categories & Unified Categories
+
+Applications can let users define custom categories (e.g., "Firewall", "Smart TV", "Solar Inverter") with custom Material icons and accent colors:
+
+#### Creating or Updating a Custom Category
+
+```dart
+SharedDeviceDatabase.instance.upsertCustomCategory(
+  CustomDeviceCategory(
+    id: 'firewall',
+    label: 'Firewall / UTM',
+    iconName: 'security',              // Mapped automatically to Icons.security
+    colorHex: '#FF5722',               // Optional accent color
+    createdAt: DateTime.now(),
+    updatedAt: DateTime.now(),
+  ),
+);
+```
+
+#### Deleting a Custom Category (Safe Cascade)
+
+When a custom category is deleted, any devices currently assigned to that category automatically have their `device_type` migrated to `'other'`:
+
+```dart
+SharedDeviceDatabase.instance.deleteCustomCategory('firewall');
+```
+
+#### Unified Category Resolver for UI Dropdowns & Filters
+
+Use `UnifiedDeviceCategory` or `SharedDeviceDatabase.instance.getUnifiedCategories()` to seamlessly populate dropdown menus, filter chips, and device icons without worrying whether a category is built-in or user-created:
+
+```dart
+// 1. Get all unified categories for a filter bar or dropdown
+final categories = SharedDeviceDatabase.instance.getUnifiedCategories();
+
+for (final cat in categories) {
+  print('${cat.label} (key: ${cat.key}, isCustom: ${cat.isCustom})');
+}
+
+// 2. Resolve category representation for a specific device
+final customCats = SharedDeviceDatabase.instance.getCustomCategories();
+final unifiedCategory = device.getUnifiedCategory(customCats);
+
+// In Flutter Widget build:
+Icon(unifiedCategory.icon, color: unifiedCategory.color)
+Text(unifiedCategory.label)
+```
+
+---
+
+### 6. Listening to Cross-Process Updates
 
 To refresh your UI or view-models whenever devices are added, updated, or removed:
 
@@ -249,22 +317,23 @@ class DeviceAwareViewModel extends ChangeNotifier {
 
 ---
 
-### 6. Querying & Filtering Devices
+### 7. Querying & Filtering Devices
 
-Query devices with keyword search, category filters, and sorting:
+Query devices with keyword search, category filters, sorting, and hidden defaults:
 
 ```dart
 final devices = SharedDeviceDatabase.instance.getAllDevices(
   query: 'cisco',           // Matches name, MAC, vendor, or notes
-  deviceType: 'switch',     // Matches DeviceCategory key, or null for all
+  deviceType: 'switch',     // Matches DeviceCategory key or custom category slug, or null for all
   sortBy: 'updated_at',     // 'name', 'mac', 'vendor', 'type', 'created_at', 'updated_at'
   ascending: false,
+  hideDefaultNamed: true,   // Excludes auto-generated "Device XX:XX:..." placeholders
 );
 ```
 
 ---
 
-### 7. Unit & Integration Testing
+### 8. Unit & Integration Testing
 
 In tests, avoid reading/writing to the host filesystem by initializing `SharedDeviceDatabase` with an in-memory SQLite database (`:memory:`):
 
