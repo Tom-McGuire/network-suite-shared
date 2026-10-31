@@ -69,6 +69,17 @@ CREATE TABLE IF NOT EXISTS shared_devices (
 CREATE INDEX IF NOT EXISTS idx_shared_name ON shared_devices(name);
 CREATE INDEX IF NOT EXISTS idx_shared_vendor ON shared_devices(vendor);
 CREATE INDEX IF NOT EXISTS idx_shared_type ON shared_devices(device_type);
+
+CREATE TABLE IF NOT EXISTS custom_device_categories (
+  id         TEXT PRIMARY KEY NOT NULL,          -- Slug/key, e.g. "firewall", "smart_tv"
+  label      TEXT NOT NULL,                      -- Display name, e.g. "Firewall / UTM", "Smart TV"
+  icon_name  TEXT NOT NULL DEFAULT 'devices_other', -- Material icon identifier key
+  color_hex  TEXT,                               -- Optional accent color, e.g. "#FF5722"
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_custom_category_label ON custom_device_categories(label);
 ```
 
 ---
@@ -306,10 +317,38 @@ void main() {
 | `getAllDevices(...)` | Lists registered devices with query, type, and sort options. |
 | `upsertDevice(SharedDevice device)` | Inserts or updates a device record. |
 | `updateDeviceName(String mac, String newName)` | Updates only the friendly name and timestamp. |
+| `updateDeviceDetails(String mac, {name, deviceType, vendor, notes})` | Updates any combination of metadata fields and triggers change notification. |
 | `deleteDevice(String mac)` | Deletes a device record by MAC address. |
+| `getCustomCategories()` | Lists user-created custom categories ordered alphabetically by label. |
+| `getCustomCategoryById(String id)` | Retrieves a specific custom category by slug ID. |
+| `upsertCustomCategory(CustomDeviceCategory category)` | Inserts or updates a user-defined category and notifies listeners. |
+| `deleteCustomCategory(String id)` | Deletes a custom category, migrates its devices to `'other'`, and notifies listeners. |
+| `getUnifiedCategories()` | Returns merged list of built-in and custom categories for UI dropdowns. |
 | `importBatch(List<SharedDevice> devices)` | Batch inserts devices inside an atomic transaction. |
 | `getDeviceCount()` | Total number of recorded devices. |
 | `close()` | Closes SQLite connection and stream controllers. |
+
+### `CustomDeviceCategory`
+
+| Member | Type | Description |
+| :--- | :--- | :--- |
+| `id` | `String` | Slug identifier (e.g. `"firewall"`, `"smart_tv"`). |
+| `label` | `String` | Human-readable display label (e.g. `"Firewall / UTM"`). |
+| `iconName` | `String` | Material icon identifier key (e.g. `"security"`, `"tv"`). |
+| `colorHex` | `String?` | Optional accent color in hex format (e.g. `"#FF5722"`). |
+| `icon` | `IconData` | Resolved Flutter Material `IconData`. |
+| `color` | `Color?` | Parsed Flutter `Color`, if defined. |
+
+### `UnifiedDeviceCategory`
+
+| Member | Type | Description |
+| :--- | :--- | :--- |
+| `key` | `String` | Category slug (e.g. `"router"`, `"firewall"`). |
+| `label` | `String` | Human-readable label for UI display. |
+| `icon` | `IconData` | Resolved Material icon. |
+| `isCustom` | `bool` | `true` for user-defined categories; `false` for built-in. |
+| `resolve(key, {customCategories})` | `static UnifiedDeviceCategory` | Resolves any slug into its unified category representation. |
+| `getAll({customCategories})` | `static List<UnifiedDeviceCategory>` | Merges built-ins with custom categories (`other` placed last). |
 
 ### `SharedDevice`
 

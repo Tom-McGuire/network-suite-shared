@@ -3,7 +3,9 @@ import 'dart:io';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart';
 
+import '../models/custom_device_category.dart';
 import '../models/shared_device.dart';
+import '../models/unified_device_category.dart';
 
 /// Manages the cross-process SQLite database storing global device identity mappings.
 ///
@@ -110,6 +112,17 @@ class SharedDeviceDatabase {
       CREATE INDEX IF NOT EXISTS idx_shared_name ON shared_devices(name);
       CREATE INDEX IF NOT EXISTS idx_shared_vendor ON shared_devices(vendor);
       CREATE INDEX IF NOT EXISTS idx_shared_type ON shared_devices(device_type);
+
+      CREATE TABLE IF NOT EXISTS custom_device_categories (
+        id TEXT PRIMARY KEY NOT NULL,          -- Slug/key, e.g. "firewall", "smart_tv"
+        label TEXT NOT NULL,                  -- Display name, e.g. "Firewall / UTM", "Smart TV"
+        icon_name TEXT NOT NULL DEFAULT 'devices_other', -- Material icon identifier key
+        color_hex TEXT,                       -- Optional accent color, e.g. "#FF5722"
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_custom_category_label ON custom_device_categories(label);
     ''');
   }
 
@@ -129,12 +142,14 @@ class SharedDeviceDatabase {
     return _rowToDevice(rows.first);
   }
 
-  /// Retrieves all registered devices, with optional search query and category filtering.
+  /// Retrieves all registered devices, with optional search query, category filtering,
+  /// and option to hide devices that only have default MAC address labels.
   List<SharedDevice> getAllDevices({
     String? query,
     String? deviceType,
     String sortBy = 'updated_at',
     bool ascending = false,
+    bool hideDefaultNamed = false,
   }) {
     final db = _db;
     if (db == null) return [];
@@ -174,7 +189,11 @@ class SharedDeviceDatabase {
       params,
     );
 
-    return rows.map(_rowToDevice).toList();
+    final devices = rows.map(_rowToDevice);
+    if (hideDefaultNamed) {
+      return devices.where((d) => d.hasCustomName).toList();
+    }
+    return devices.toList();
   }
 
   /// Inserts or updates a device record.
@@ -237,6 +256,140 @@ class SharedDeviceDatabase {
     db.execute('DELETE FROM shared_devices WHERE mac_address = ?', [normalizedMac]);
 
     notifyChanged();
+  }
+
+  /// Updates device metadata (name, category/device_type, vendor, notes)
+  /// for a device identified by its MAC address.
+  ///
+  /// Any parameter left `null` will keep its existing value unchanged.
+  void updateDeviceDetails(
+    String mac, {
+    String? name,
+    String? deviceType,
+    String? vendor,
+    String? notes,
+  }) {
+    final db = _db;
+    if (db == null) return;
+
+    final normalizedMac = SharedDevice.normalizeMac(mac);
+    final now = DateTime.now().toIso8601String();
+
+    final updates = <String>['updated_at = ?'];
+    final params = <dynamic>[now];
+
+    if (name != null) {
+      updates.add('name = ?');
+      params.add(name.trim());
+    }
+    if (deviceType != null) {
+      updates.add('device_type = ?');
+      params.add(deviceType.trim().toLowerCase());
+    }
+    if (vendor != null) {
+      updates.add('vendor = ?');
+      params.add(vendor.trim());
+    }
+    if (notes != null) {
+      updates.add('notes = ?');
+      params.add(notes.trim());
+    }
+
+    params.add(normalizedMac);
+
+    db.execute('''
+      UPDATE shared_devices
+      SET ${updates.join(', ')}
+      WHERE mac_address = ?
+    ''', params);
+
+    notifyChanged();
+  }
+
+  /// Retrieves all user-defined custom categories ordered alphabetically by label.
+  List<CustomDeviceCategory> getCustomCategories() {
+    final db = _db;
+    if (db == null) return [];
+
+    final rows = db.select(
+      'SELECT * FROM custom_device_categories ORDER BY label ASC',
+    );
+
+    return rows.map((row) => CustomDeviceCategory.fromMap(row)).toList();
+  }
+
+  /// Retrieves a single custom category by its [id] slug, or `null` if not found.
+  CustomDeviceCategory? getCustomCategoryById(String id) {
+    final db = _db;
+    if (db == null) return null;
+
+    final rows = db.select(
+      'SELECT * FROM custom_device_categories WHERE id = ? LIMIT 1',
+      [id.trim().toLowerCase()],
+    );
+
+    if (rows.isEmpty) return null;
+    return CustomDeviceCategory.fromMap(rows.first);
+  }
+
+  /// Inserts or replaces a user-defined custom category.
+  void upsertCustomCategory(CustomDeviceCategory category) {
+    final db = _db;
+    if (db == null) return;
+
+    final now = DateTime.now().toIso8601String();
+    db.execute('''
+      INSERT INTO custom_device_categories (
+        id, label, icon_name, color_hex, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        label = excluded.label,
+        icon_name = excluded.icon_name,
+        color_hex = excluded.color_hex,
+        updated_at = excluded.updated_at
+    ''', [
+      category.id.trim().toLowerCase(),
+      category.label.trim(),
+      category.iconName.trim(),
+      category.colorHex?.trim(),
+      category.createdAt.toIso8601String(),
+      now,
+    ]);
+
+    notifyChanged();
+  }
+
+  /// Deletes a user-defined custom category by [id], updates any devices
+  /// assigned to this category to have `device_type = 'other'`, and fires `notifyChanged()`.
+  void deleteCustomCategory(String id) {
+    final db = _db;
+    if (db == null) return;
+
+    final cleanId = id.trim().toLowerCase();
+    final now = DateTime.now().toIso8601String();
+
+    db.execute('BEGIN TRANSACTION;');
+    try {
+      db.execute(
+        'DELETE FROM custom_device_categories WHERE id = ?',
+        [cleanId],
+      );
+      db.execute(
+        'UPDATE shared_devices SET device_type = ?, updated_at = ? WHERE LOWER(device_type) = ?',
+        ['other', now, cleanId],
+      );
+      db.execute('COMMIT;');
+    } catch (e) {
+      db.execute('ROLLBACK;');
+      rethrow;
+    }
+
+    notifyChanged();
+  }
+
+  /// Resolves the unified list of categories combining built-ins and custom categories.
+  List<UnifiedDeviceCategory> getUnifiedCategories() {
+    return UnifiedDeviceCategory.getAll(customCategories: getCustomCategories());
   }
 
   /// Returns the total count of registered devices.
