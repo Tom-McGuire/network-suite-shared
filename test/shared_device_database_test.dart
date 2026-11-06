@@ -1,5 +1,8 @@
+import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:network_suite_shared/network_suite_shared.dart';
+import 'package:path/path.dart' as p;
+import 'package:sqlite3/sqlite3.dart';
 
 void main() {
   group('SharedDevice model & MAC Normalization', () {
@@ -358,6 +361,179 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       sub.cancel();
       expect(notificationCount, greaterThanOrEqualTo(4));
+    });
+  });
+
+  group('SharedDeviceDatabase Advanced Operations & Utilities', () {
+    test('getDefaultDirectoryPath and getDefaultDatabasePath return valid non-empty paths', () {
+      final dir = SharedDeviceDatabase.getDefaultDirectoryPath();
+      final dbPath = SharedDeviceDatabase.getDefaultDatabasePath();
+
+      expect(dir, isNotEmpty);
+      expect(dbPath, isNotEmpty);
+      expect(dbPath, contains('shared_devices.db'));
+    });
+
+    test('lifecycle: isInitialized, databasePath, close, and getDeviceCount', () async {
+      final db = SharedDeviceDatabase();
+      expect(db.isInitialized, isFalse);
+      expect(db.databasePath, isNull);
+      expect(db.getDeviceCount(), 0);
+
+      await db.init(dbPath: ':memory:');
+      expect(db.isInitialized, isTrue);
+      expect(db.databasePath, ':memory:');
+      expect(db.getDeviceCount(), 0);
+
+      final now = DateTime.now();
+      db.upsertDevice(SharedDevice(
+        macAddress: '11:22:33:44:55:66',
+        name: 'Node 1',
+        sourceApp: 'test',
+        createdAt: now,
+        updatedAt: now,
+      ));
+      expect(db.getDeviceCount(), 1);
+
+      db.close();
+      expect(db.isInitialized, isFalse);
+    });
+
+    test('importBatch imports multiple devices in an atomic transaction', () async {
+      final db = SharedDeviceDatabase();
+      await db.init(dbPath: ':memory:');
+
+      final now = DateTime.now();
+      final batch = [
+        SharedDevice(
+          macAddress: 'AA:11:11:11:11:11',
+          name: 'Device A',
+          sourceApp: 'batch_test',
+          createdAt: now,
+          updatedAt: now,
+        ),
+        SharedDevice(
+          macAddress: 'BB:22:22:22:22:22',
+          name: 'Device B',
+          sourceApp: 'batch_test',
+          createdAt: now,
+          updatedAt: now,
+        ),
+      ];
+
+      db.importBatch(batch);
+      expect(db.getDeviceCount(), 2);
+      expect(db.getDeviceByMac('AA:11:11:11:11:11'), isNotNull);
+      expect(db.getDeviceByMac('BB:22:22:22:22:22'), isNotNull);
+
+      // Empty batch does nothing
+      db.importBatch([]);
+      expect(db.getDeviceCount(), 2);
+
+      db.close();
+    });
+
+    test('getUnifiedCategories returns combined built-in and custom list', () async {
+      final db = SharedDeviceDatabase();
+      await db.init(dbPath: ':memory:');
+
+      final now = DateTime.now();
+      db.upsertCustomCategory(CustomDeviceCategory(
+        id: 'firewall',
+        label: 'Firewall',
+        createdAt: now,
+        updatedAt: now,
+      ));
+
+      final unified = db.getUnifiedCategories();
+      expect(unified.any((c) => c.key == 'firewall' && c.isCustom), isTrue);
+      expect(unified.any((c) => c.key == 'router' && !c.isCustom), isTrue);
+      expect(unified.last.key, 'other');
+
+      db.close();
+    });
+
+    test('queries devices with all whitelisted sort columns and sort orders', () async {
+      final db = SharedDeviceDatabase();
+      await db.init(dbPath: ':memory:');
+
+      final t1 = DateTime.parse('2026-10-01T10:00:00.000Z');
+      final t2 = DateTime.parse('2026-10-02T10:00:00.000Z');
+
+      db.upsertDevice(SharedDevice(
+        macAddress: '00:00:00:00:00:01',
+        name: 'Alpha Device',
+        vendor: 'Apple',
+        deviceType: 'pc',
+        sourceApp: 'test',
+        createdAt: t1,
+        updatedAt: t1,
+      ));
+
+      db.upsertDevice(SharedDevice(
+        macAddress: '00:00:00:00:00:02',
+        name: 'Beta Device',
+        vendor: 'Cisco',
+        deviceType: 'router',
+        sourceApp: 'test',
+        createdAt: t2,
+        updatedAt: t2,
+      ));
+
+      for (final col in ['name', 'mac', 'vendor', 'type', 'created_at', 'updated_at', 'unknown_fallback']) {
+        final asc = db.getAllDevices(sortBy: col, ascending: true);
+        final desc = db.getAllDevices(sortBy: col, ascending: false);
+        expect(asc.length, 2);
+        expect(desc.length, 2);
+      }
+
+      db.close();
+    });
+
+    test('updateDeviceDetails updates nothing when device is missing', () async {
+      final db = SharedDeviceDatabase();
+      await db.init(dbPath: ':memory:');
+
+      // Does not throw when MAC not found
+      expect(
+        () => db.updateDeviceDetails('99:99:99:99:99:99', name: 'Nonexistent'),
+        returnsNormally,
+      );
+
+      db.close();
+    });
+
+    test('database can be initialized with customPath', () {
+      final db = SharedDeviceDatabase(customPath: ':memory:');
+      expect(db.databasePath, ':memory:');
+    });
+
+    test('SharedDeviceDatabase.instance returns working singleton', () async {
+      final instance = SharedDeviceDatabase.instance;
+      expect(instance, isNotNull);
+      expect(SharedDeviceDatabase.instance, same(instance));
+    });
+
+    test('database can be initialized with customDb', () {
+      final inMemorySqlite = sqlite3.openInMemory();
+      final db = SharedDeviceDatabase(customDb: inMemorySqlite);
+      expect(db.isInitialized, isTrue);
+      expect(db.getDeviceCount(), 0);
+      db.close();
+    });
+
+    test('initializes database on disk creating parent directories', () async {
+      final tempDir = Directory.systemTemp.createTempSync('ns_db_test_');
+      final dbFilePath = p.join(tempDir.path, 'nested', 'test_shared.db');
+
+      final db = SharedDeviceDatabase();
+      await db.init(dbPath: dbFilePath);
+
+      expect(db.isInitialized, isTrue);
+      expect(File(dbFilePath).existsSync(), isTrue);
+
+      db.close();
+      tempDir.deleteSync(recursive: true);
     });
   });
 }
